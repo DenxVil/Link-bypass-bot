@@ -8,6 +8,9 @@ from playwright.async_api import async_playwright
 from .resolver import UnsafeURL, validate_public_url
 
 
+BROWSER_SEMAPHORE = __import__("asyncio").Semaphore(1)
+
+
 CHALLENGE_MARKERS = (
     "verify you are human",
     "checking your browser",
@@ -19,6 +22,12 @@ CHALLENGE_MARKERS = (
 
 
 async def resolve_with_browser(url: str, timeout: float = 12.0) -> tuple[str, int]:
+    # Keep one Chromium process active at a time on the small free instance.
+    async with BROWSER_SEMAPHORE:
+        return await _resolve_with_browser(url, timeout)
+
+
+async def _resolve_with_browser(url: str, timeout: float = 12.0) -> tuple[str, int]:
     """Resolve ordinary client-side navigation in an isolated Chromium page.
 
     This deliberately does not solve CAPTCHAs, click ads, defeat challenges,
