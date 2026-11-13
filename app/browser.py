@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 
@@ -8,7 +9,7 @@ from playwright.async_api import async_playwright
 from .resolver import UnsafeURL, validate_public_url
 
 
-BROWSER_SEMAPHORE = __import__("asyncio").Semaphore(1)
+BROWSER_SEMAPHORE = asyncio.Semaphore(1)
 
 
 CHALLENGE_MARKERS = (
