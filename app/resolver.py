@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import binascii
 import html
 import ipaddress
 import json
@@ -107,11 +109,32 @@ def _targets_from_json(value, base_url: str, depth: int = 0) -> list[str]:
     return found
 
 
+
+def _extract_base64_target(text: str, base_url: str) -> str | None:
+    """Decode obvious base64/URL-safe-base64 destination strings."""
+    for match in re.finditer(r"(?<![A-Za-z0-9_])[A-Za-z0-9_+/-]{20,}={0,2}", text[:MAX_BODY_BYTES]):
+        token = match.group(0)
+        try:
+            raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+            decoded = raw.decode("utf-8", errors="strict").strip().strip("\\\"'")
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            continue
+        url_match = re.search(r"https?://[^\\s\\\"'<>]+", decoded, re.IGNORECASE)
+        candidate = url_match.group(0).rstrip(".,;:!?)") if url_match else decoded
+        target = _http_target(candidate, base_url)
+        if target and target != base_url:
+            return target
+    return None
+
+
 def _extract_embedded_target(body: bytes, content_type: str, base_url: str) -> str | None:
     if not body or len(body) > MAX_BODY_BYTES:
         return None
     text = body.decode("utf-8", errors="replace")
     lowered_type = content_type.lower()
+    decoded_target = _extract_base64_target(text, base_url)
+    if decoded_target:
+        return decoded_target
     if "json" in lowered_type or text.lstrip().startswith(("{", "[")):
         try:
             targets = _targets_from_json(json.loads(text), base_url)
@@ -216,6 +239,20 @@ async def resolve_url(
             except httpx.HTTPError as exc:
                 raise UnsafeURL("The destination could not be reached.") from exc
             if not embedded:
+                if "html" in content_type.lower():
+                    # Browser fallback handles ordinary JavaScript-driven
+                    # navigation. It does not interact with ads or challenges.
+                    from .browser import resolve_with_browser
+
+                    browser_url, browser_hops = await resolve_with_browser(current, timeout)
+                    if browser_url != current:
+                        if browser_url in visited:
+                            raise UnsafeURL(
+                                "The browser encountered a redirect loop before exposing a final destination."
+                            )
+                        current = browser_url
+                        continue
+                    return current, hop + browser_hops
                 return current, hop
             # An embedded redirect back to a visited page is also a loop.
             # Do not return the current interstitial page as if it were final.
