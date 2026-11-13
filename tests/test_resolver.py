@@ -52,3 +52,12 @@ def test_ignores_oversized_body():
 def test_normalise_rejects_non_http_target():
     with pytest.raises(UnsafeURL):
         _normalise_url("javascript:alert(1)")
+
+
+def test_extracts_base64_destination():
+    import base64
+
+    destination = "https://example.org/final/path"
+    encoded = base64.b64encode(destination.encode()).decode()
+    body = f'<script>const target = "{encoded}";</script>'.encode()
+    assert _extract_embedded_target(body, "text/html", "https://short.test/abc") == destination
