@@ -81,7 +81,7 @@ async def resolve_with_browser(url: str, timeout: float = 12.0) -> tuple[str, in
                 # No buttons are clicked and no challenge is solved.
                 initial_url = page.url
                 initial_text = (await page.locator("body").inner_text(timeout=1500)).lower()[:5000]
-                if re.search(r"\\b\\d{1,2}\\s*(seconds?|secs?)\\b|please wait|redirecting in|continue in|link is ready", initial_text):
+                if re.search(r"\b\d{1,2}\s*(seconds?|secs?)\b|please wait|redirecting in|continue in|link is ready", initial_text):
                     wait_seconds = max(0, min(int(os.getenv("BROWSER_WAIT_SECONDS", "15")), 15))
                     for _ in range(wait_seconds):
                         await page.wait_for_timeout(1000)
