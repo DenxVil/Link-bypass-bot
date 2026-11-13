@@ -17,6 +17,8 @@ services:
         value: "8"
       - key: REQUEST_TIMEOUT
         value: "12"
+      - key: BROWSER_WAIT_SECONDS
+        value: "15"
       - key: CACHE_TTL_SECONDS
         value: "86400"
       - key: RATE_LIMIT_COUNT
