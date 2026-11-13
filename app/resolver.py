@@ -239,7 +239,7 @@ async def resolve_url(
             except httpx.HTTPError as exc:
                 raise UnsafeURL("The destination could not be reached.") from exc
             if not embedded:
-                if "html" in content_type.lower() and re.search(r"<script\\b", body.decode("utf-8", errors="replace"), re.IGNORECASE):
+                if "html" in content_type.lower() and re.search(r"""<script\b""", body.decode("utf-8", errors="replace"), re.IGNORECASE):
                     # Browser fallback handles ordinary JavaScript-driven
                     # navigation. It does not interact with ads or challenges.
                     from .browser import resolve_with_browser
