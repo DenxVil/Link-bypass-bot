@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -19,8 +20,18 @@ def _connect():
     return conn
 
 
+@contextmanager
+def _db():
+    conn = _connect()
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
 def init_storage():
-    with _connect() as conn:
+    with _db() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS resolutions (
                 source TEXT PRIMARY KEY,
@@ -47,7 +58,7 @@ def cache_key(url: str) -> str:
 
 def get_cached(source: str):
     cutoff = time.time() - CACHE_TTL_SECONDS
-    with _connect() as conn:
+    with _db() as conn:
         row = conn.execute(
             "SELECT destination, hops FROM resolutions WHERE source=? AND created_at>=?",
             (cache_key(source), cutoff),
@@ -59,7 +70,7 @@ def get_cached(source: str):
 
 
 def put_cached(source: str, destination: str, hops: int):
-    with _connect() as conn:
+    with _db() as conn:
         conn.execute(
             """INSERT INTO resolutions(source, destination, hops, created_at)
                VALUES(?, ?, ?, ?)
@@ -74,7 +85,7 @@ def put_cached(source: str, destination: str, hops: int):
 def allow_request(user_id: int) -> tuple[bool, int]:
     now = time.time()
     cutoff = now - RATE_LIMIT_WINDOW
-    with _connect() as conn:
+    with _db() as conn:
         conn.execute("DELETE FROM rate_events WHERE created_at<?", (cutoff,))
         count = conn.execute(
             "SELECT COUNT(*) FROM rate_events WHERE user_id=? AND created_at>=?",
