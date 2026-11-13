@@ -211,6 +211,12 @@ async def resolve_url(
                 raise UnsafeURL("The destination could not be reached.") from exc
             if not embedded:
                 return current, hop
+            # HTML/JS pages often contain self-referential navigation URLs.
+            # Treat an embedded target that points to the current or a previously
+            # visited page as a non-actionable page reference, not an HTTP loop.
+            # Actual HTTP Location redirect cycles are still rejected above.
+            if embedded in visited:
+                return current, hop
             if hop >= max_redirects:
                 raise UnsafeURL("Too many redirects.")
             current = embedded
