@@ -122,16 +122,22 @@ async def handle_message(message):
             max_redirects=config.MAX_REDIRECTS,
             timeout=config.REQUEST_TIMEOUT,
         )
-        elapsed_seconds = int(time.perf_counter() - started_at)
+        elapsed_seconds = time.perf_counter() - started_at
         safe_original = html.escape(url)
         safe_destination = html.escape(destination)
         safe_href = html.escape(destination, quote=True)
         result = (
-            f"<b>Original Link :</b> ✅ {safe_original}\n\n"
-            f"<b>Bypassed Link :</b> ✅ <a href=\"{safe_href}\">{safe_destination}</a>\n\n"
-            f"<b>Time Taken :</b> {elapsed_seconds} seconds\n\n"
-            "─────────────────\n\n"
-            "<b>Powered By @Link_Bypasss</b>"
+            "✨ <b>LINK SUCCESSFULLY RESOLVED</b>\n"
+            "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
+            "📥 <b>Original URL</b>\n"
+            f"<code>{safe_original}</code>\n\n"
+            "🚀 <b>Bypassed Destination</b>\n"
+            f"🔗 <a href=\"{safe_href}\">{safe_destination}</a>\n\n"
+            "<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
+            f"⏱ <b>Processing Time:</b> <code>{elapsed_seconds:.2f} sec</code>\n\n"
+            "⚡ <i>Quick. Simple. Hassle-free.</i>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "💠 <b>Powered by</b> @Link_Bypasss"
         )
 
         await status.edit_text(
