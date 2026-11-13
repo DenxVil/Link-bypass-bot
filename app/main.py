@@ -116,32 +116,23 @@ async def handle_message(message):
     )
 
     try:
-        destination, hops = await resolve_url(
+        started_at = time.perf_counter()
+        destination, _hops = await resolve_url(
             url,
             max_redirects=config.MAX_REDIRECTS,
             timeout=config.REQUEST_TIMEOUT,
         )
+        elapsed_seconds = int(time.perf_counter() - started_at)
+        safe_original = html.escape(url)
         safe_destination = html.escape(destination)
         safe_href = html.escape(destination, quote=True)
-        hop_label = "redirect" if hops == 1 else "redirects"
         result = (
-            "✅ <b>LINK RESOLVED</b>\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            f"📍 <b>Destination</b>\n<code>{safe_destination}</code>\n\n"
-            f"↪️ <b>Redirects followed:</b> {hops}\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            f"🔗 <a href=\"{safe_href}\">Open destination</a>\n"
-            "<i>Always verify an unfamiliar link before opening it.</i>"
+            f"<b>Original Link :</b> ✅ {safe_original}\n\n"
+            f"<b>Bypassed Link :</b> ✅ <a href=\"{safe_href}\">{safe_destination}</a>\n\n"
+            f"<b>Time Taken :</b> {elapsed_seconds} seconds\n\n"
+            "─────────────────\n\n"
+            "<b>Powered By @Link_Bypasss</b>"
         )
-        # Keep the singular/plural wording explicit without changing the result layout.
-        result = result.replace(
-            f"Redirects followed:</b> {hops}",
-            f"{hop_label.capitalize()} followed:</b> {hops}",
-        )
-        note = await explain_destination(destination)
-        if note:
-            result += f"\n\n🤖 <b>AI context</b>\n{html.escape(note)}"
-            result += "\n<i>AI context is informational, not a security verdict.</i>"
 
         await status.edit_text(
             result,
