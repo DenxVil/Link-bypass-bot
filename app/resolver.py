@@ -1,12 +1,17 @@
 import asyncio
+import html
 import ipaddress
+import json
+import re
 import socket
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urljoin, urlsplit, urlunsplit
 
 import httpx
 
 REDIRECT_CODES = {301, 302, 303, 307, 308}
 MAX_URL_LENGTH = 2048
+MAX_BODY_BYTES = 256 * 1024
+TARGET_KEYS = {"url", "target", "dest", "destination", "redirect", "redirect_url", "long_url", "link", "u"}
 
 
 class UnsafeURL(ValueError):
@@ -23,7 +28,7 @@ def _normalise_url(url: str) -> str:
             raise UnsafeURL("Only HTTP and HTTPS links are supported.")
         if not parts.hostname or parts.username is not None or parts.password is not None:
             raise UnsafeURL("Invalid URL or embedded credentials are not supported.")
-        port = parts.port  # raises ValueError for malformed ports
+        port = parts.port
         if port is not None and port not in {80, 443}:
             raise UnsafeURL("Non-standard ports are not supported.")
         host = parts.hostname.encode("idna").decode("ascii").lower().rstrip(".")
@@ -47,24 +52,20 @@ async def validate_public_url(url: str) -> None:
         literal = ipaddress.ip_address(host)
     except ValueError:
         literal = None
-
     if literal is not None:
         if not literal.is_global:
             raise UnsafeURL("Private or reserved IP destinations are blocked.")
         return
-
     try:
         records = await asyncio.wait_for(
             asyncio.get_running_loop().getaddrinfo(
-                host,
-                parts.port or (443 if parts.scheme == "https" else 80),
+                host, parts.port or (443 if parts.scheme == "https" else 80),
                 type=socket.SOCK_STREAM,
             ),
             timeout=4.0,
         )
     except (OSError, asyncio.TimeoutError) as exc:
         raise UnsafeURL("The destination host could not be resolved.") from exc
-
     if not records:
         raise UnsafeURL("The destination host did not resolve.")
     for record in records:
@@ -76,17 +77,96 @@ async def validate_public_url(url: str) -> None:
             raise UnsafeURL("The destination resolves to a private or reserved network.")
 
 
+def _http_target(value: str, base_url: str) -> str | None:
+    value = html.unescape(str(value)).strip().strip("\"'")
+    value = value.replace("\\/", "/")
+    if not value or value.startswith(("javascript:", "data:", "#")):
+        return None
+    try:
+        return _normalise_url(urljoin(base_url, value))
+    except UnsafeURL:
+        return None
+
+
+def _targets_from_json(value, base_url: str, depth: int = 0) -> list[str]:
+    if depth > 6:
+        return []
+    found = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if str(key).lower() in TARGET_KEYS and isinstance(item, str):
+                target = _http_target(item, base_url)
+                if target:
+                    found.append(target)
+            elif isinstance(item, (dict, list)):
+                found.extend(_targets_from_json(item, base_url, depth + 1))
+    elif isinstance(value, list):
+        for item in value[:100]:
+            if isinstance(item, (dict, list)):
+                found.extend(_targets_from_json(item, base_url, depth + 1))
+    return found
+
+
+def _extract_embedded_target(body: bytes, content_type: str, base_url: str) -> str | None:
+    if not body or len(body) > MAX_BODY_BYTES:
+        return None
+    text = body.decode("utf-8", errors="replace")
+    lowered_type = content_type.lower()
+    if "json" in lowered_type or text.lstrip().startswith(("{", "[")):
+        try:
+            targets = _targets_from_json(json.loads(text), base_url)
+            if targets:
+                return targets[0]
+        except (json.JSONDecodeError, RecursionError):
+            pass
+
+    meta = re.search(
+        r"<meta[^>]+http-equiv\s*=\s*['\"]?refresh['\"]?[^>]+content\s*=\s*['\"][^'\"]*?url\s*=\s*([^;'\"]+)",
+        text, re.IGNORECASE,
+    )
+    if meta:
+        target = _http_target(meta.group(1), base_url)
+        if target:
+            return target
+
+    patterns = (
+        r"(?:window\.)?location\.href\s*=\s*['\"]([^'\"]+)['\"]",
+        r"(?:window\.)?location\.assign\(\s*['\"]([^'\"]+)['\"]\s*\)",
+        r"(?:window\.)?location\.replace\(\s*['\"]([^'\"]+)['\"]\s*\)",
+        r"window\.open\(\s*['\"]([^'\"]+)['\"]",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            target = _http_target(match.group(1), base_url)
+            if target:
+                return target
+
+    for key, value in parse_qsl(urlsplit(base_url).query, keep_blank_values=False):
+        if key.lower() in TARGET_KEYS:
+            target = _http_target(unquote(value), base_url)
+            if target and target != base_url:
+                return target
+    return None
+
+
+async def _read_limited_body(response: httpx.Response) -> bytes:
+    chunks = []
+    total = 0
+    async for chunk in response.aiter_bytes():
+        total += len(chunk)
+        if total > MAX_BODY_BYTES:
+            return b""
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 async def resolve_url(
     url: str,
     max_redirects: int = 8,
     timeout: float = 10.0,
 ) -> tuple[str, int]:
-    """Follow public HTTP redirects without downloading response bodies.
-
-    DNS is checked before each hop and automatic redirects are disabled.
-    The HTTP client's own DNS lookup is separate; use network-level egress
-    restrictions for stronger protection against DNS-rebinding attacks.
-    """
+    """Follow HTTP and common static HTML/JSON/JavaScript redirects safely."""
     current = _normalise_url(url)
     max_redirects = max(0, min(int(max_redirects), 10))
     timeout = max(3.0, min(float(timeout), 20.0))
@@ -100,7 +180,7 @@ async def resolve_url(
         limits=limits,
         headers={
             "User-Agent": "Mozilla/5.0 (compatible; LinkResolverBot/1.0)",
-            "Accept": "*/*",
+            "Accept": "text/html,application/json,text/plain,*/*",
         },
         trust_env=False,
     ) as client:
@@ -110,25 +190,28 @@ async def resolve_url(
                 raise UnsafeURL("Redirect loop detected.")
             visited.add(current)
             await validate_public_url(current)
-
             try:
-                # Stream and close immediately: redirect resolution needs
-                # response headers, not the destination page's content.
-                async with client.stream(
-                    "GET", current, headers={"Range": "bytes=0-0"}
-                ) as response:
-                    if response.status_code not in REDIRECT_CODES:
+                async with client.stream("GET", current) as response:
+                    if response.status_code in REDIRECT_CODES:
+                        location = response.headers.get("location")
+                        if not location:
+                            return current, hop
+                        if hop >= max_redirects:
+                            raise UnsafeURL("Too many redirects.")
+                        current = urljoin(current, location)
+                        continue
+                    content_type = response.headers.get("content-type", "")
+                    if not any(t in content_type.lower() for t in ("text/html", "json", "text/plain", "javascript")):
                         return current, hop
-                    location = response.headers.get("location")
+                    body = await _read_limited_body(response)
+                    embedded = _extract_embedded_target(body, content_type, current)
             except httpx.TimeoutException as exc:
                 raise UnsafeURL("The destination timed out.") from exc
             except httpx.HTTPError as exc:
                 raise UnsafeURL("The destination could not be reached.") from exc
-
-            if not location:
+            if not embedded:
                 return current, hop
             if hop >= max_redirects:
                 raise UnsafeURL("Too many redirects.")
-            current = urljoin(current, location)
-
+            current = embedded
     return current, max_redirects
