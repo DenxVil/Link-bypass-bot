@@ -77,10 +77,8 @@ async def lifespan(app: FastAPI):
         log.warning("BOT_TOKEN missing; service is healthy but Telegram bot is inactive")
     yield
     if bot:
-        try:
-            await bot.delete_webhook(drop_pending_updates=False)
-        except Exception:
-            log.exception("Webhook cleanup failed")
+        # Do not delete the webhook during graceful shutdown: overlapping
+        # zero-downtime deploys could otherwise unregister the new instance.
         await bot.session.close()
 
 
