@@ -188,10 +188,11 @@ async def resolve_url(
         for hop in range(max_redirects + 1):
             current = _normalise_url(current)
             if current in visited:
-                # Some shorteners intentionally bounce between tracking URLs.
-                # Stop safely and return the last distinct URL reached instead
-                # of failing the entire request with a loop error.
-                return last_unique, max(0, hop - 1)
+                # Never report an intermediate tracking page as a successful
+                # destination when the shortener is cycling between URLs.
+                raise UnsafeURL(
+                    "The shortener is cycling between redirect pages and did not reveal a final destination."
+                )
             visited.add(current)
             last_unique = current
             await validate_public_url(current)
@@ -216,12 +217,12 @@ async def resolve_url(
                 raise UnsafeURL("The destination could not be reached.") from exc
             if not embedded:
                 return current, hop
-            # HTML/JS pages often contain self-referential navigation URLs.
-            # Treat an embedded target that points to the current or a previously
-            # visited page as a non-actionable page reference, not an HTTP loop.
-            # Actual HTTP Location redirect cycles are still rejected above.
+            # An embedded redirect back to a visited page is also a loop.
+            # Do not return the current interstitial page as if it were final.
             if embedded in visited:
-                return current, hop
+                raise UnsafeURL(
+                    "The shortener returned a redirect loop before exposing the final destination."
+                )
             if hop >= max_redirects:
                 raise UnsafeURL("Too many redirects.")
             current = embedded
