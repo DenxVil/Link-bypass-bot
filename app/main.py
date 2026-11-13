@@ -12,52 +12,53 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from . import config
-from .ai import explain_destination
 from .resolver import UnsafeURL, resolve_url
+from .storage import allow_request, get_cached, init_storage, put_cached
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("link-resolver")
 bot: Bot | None = None
 dp = Dispatcher()
-user_hits: dict[int, list[float]] = {}
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 
 WELCOME_TEXT = (
     "👋 <b>Welcome to Link Resolver</b>\n"
-    "<i>Your quick assistant for expanding shortened links.</i>\n\n"
-    "🔎 <b>What I do</b>\n"
-    "  • Follow public HTTP(S) redirects\n"
-    "  • Expand supported short links\n"
-    "  • Show the resolved destination clearly\n"
-    "  • Provide an optional AI-generated context note\n\n"
+    "<i>Your quick assistant for expanding supported shortened links.</i>\n\n"
+    "🔎 <b>Features</b>\n"
+    "  • Trace public HTTP redirects and encoded destinations\n"
+    "  • Use Chromium for ordinary JavaScript navigation\n"
+    "  • Cache successful results for faster repeat lookups\n"
+    "  • Show live progress and the final resolved URL\n\n"
     "🚀 <b>How to use</b>\n"
-    "  1. Copy a shortened link\n"
-    "  2. Send it here\n"
-    "  3. I’ll trace the redirects and return the result\n\n"
-    "💡 <b>Tip:</b> You can send a link by itself or include it in a message.\n\n"
-    "Use /help to see commands and limitations."
+    "Send a shortened link directly, or use <code>/bypass URL</code>.\n\n"
+    "Use /help for commands and limitations."
 )
 
 HELP_TEXT = (
     "📘 <b>LINK RESOLVER — HELP</b>\n\n"
-    "<b>Available commands</b>\n"
-    "  /start — Open the welcome message\n"
+    "<b>Commands</b>\n"
+    "  /start — Welcome and getting started\n"
+    "  /bypass URL — Resolve a link\n"
     "  /help — Show these instructions\n"
     "  /about — About this bot\n\n"
-    "<b>Resolve a link</b>\n"
-    "Send any public link beginning with <code>http://</code> or <code>https://</code>.\n\n"
-    "<b>Important limitations</b>\n"
-    "  • Some links need JavaScript, cookies, or a browser session.\n"
-    "  • CAPTCHA, login pages, paywalls, and anti-bot checks cannot be bypassed.\n"
-    "  • A resolved URL is not a guarantee that its destination is safe.\n\n"
-    "⚠️ <b>Stay cautious:</b> Check unfamiliar destinations before opening them."
+    "<b>Resolution methods</b>\n"
+    "  • HTTP redirect tracing and static destination extraction\n"
+    "  • Base64/URL-safe-base64 destination extraction\n"
+    "  • Headless Chromium for ordinary JavaScript navigation\n"
+    "  • SQLite cache and a limit of 40 requests per hour per user\n\n"
+    "<b>Limitations</b>\n"
+    "  • CAPTCHA, login, paywalls, and anti-bot challenges are not bypassed.\n"
+    "  • The bot does not click ads or replay protected gateway tokens.\n"
+    "  • Some sites may require a real user session.\n\n"
+    "⚠️ A resolved URL is not a guarantee that its destination is safe."
 )
 
 ABOUT_TEXT = (
     "ℹ️ <b>About Link Resolver</b>\n\n"
     "A Telegram utility that follows supported public web redirects and displays "
-    "the resulting destination in a clean, readable format.\n\n"
-    "Built for convenience. It does not certify links as safe or bypass access controls."
+    "the resulting destination. It uses HTTP tracing, static extraction, and a "
+    "limited browser fallback for ordinary JavaScript navigation.\n\n"
+    "It does not certify links as safe or bypass access controls."
 )
 
 
@@ -86,60 +87,62 @@ async def handle_message(message):
     if not match:
         await message.answer(
             "🔗 <b>No link detected</b>\n\n"
-            "Please send a public <code>http://</code> or <code>https://</code> URL.\n"
-            "Use /help for instructions.",
+            "Send a public <code>http://</code> or <code>https://</code> URL, "
+            "or use <code>/bypass URL</code>.",
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
         return
 
-    now = time.monotonic()
-    hits = [
-        stamp for stamp in user_hits.get(message.from_user.id, [])
-        if now - stamp < 60
-    ]
-    if len(hits) >= 8:
+    allowed, retry_after = allow_request(message.from_user.id)
+    if not allowed:
+        minutes = max(1, (retry_after + 59) // 60)
         await message.answer(
-            "⏳ <b>Rate limit reached</b>\nPlease wait a minute before resolving another link.",
+            f"⏳ <b>Rate limit reached</b>\nTry again in approximately {minutes} minute(s).",
             parse_mode="HTML",
         )
         return
-    hits.append(now)
-    user_hits[message.from_user.id] = hits
 
     url = match.group(0).rstrip(".,;:!?)\\]")
     status = await message.answer(
         "⏳ <b>Resolving your link…</b>\n"
-        "<i>Following supported redirects. This may take a few seconds.</i>",
+        "<i>Tracing redirects and checking supported page navigation.</i>",
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
 
     try:
         started_at = time.perf_counter()
-        destination, _hops = await resolve_url(
-            url,
-            max_redirects=config.MAX_REDIRECTS,
-            timeout=config.REQUEST_TIMEOUT,
-        )
+        cached = get_cached(url)
+        was_cached = cached is not None
+        if cached:
+            destination, hops = cached
+        else:
+            destination, hops = await resolve_url(
+                url,
+                max_redirects=config.MAX_REDIRECTS,
+                timeout=config.REQUEST_TIMEOUT,
+            )
+            put_cached(url, destination, hops)
+
         elapsed_seconds = time.perf_counter() - started_at
         safe_original = html.escape(url)
         safe_destination = html.escape(destination)
         safe_href = html.escape(destination, quote=True)
+        cache_note = "⚡ <i>Served from cache</i>\n" if was_cached else ""
         result = (
-            "✨ <b>LINK SUCCESSFULLY RESOLVED</b>\n"
-            "<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
-            "📥 <b>Original URL</b>\n"
+            "🔗 <b>LINK RESOLUTION COMPLETE</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "📥 <b>Original Link</b>\n"
             f"<code>{safe_original}</code>\n\n"
-            "🚀 <b>Bypassed Destination</b>\n"
+            "🚀 <b>Final Destination</b>\n"
             f"🔗 <a href=\"{safe_href}\">{safe_destination}</a>\n\n"
-            "<code>━━━━━━━━━━━━━━━━━━━━</code>\n"
-            f"⏱ <b>Processing Time:</b> <code>{elapsed_seconds:.2f} sec</code>\n\n"
-            "⚡ <i>Quick. Simple. Hassle-free.</i>\n"
+            f"⏱ <b>Time Taken:</b> <code>{elapsed_seconds:.2f} seconds</code>\n"
+            f"🧭 <b>Redirect steps:</b> <code>{hops}</code>\n"
+            f"{cache_note}\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "💠 <b>Powered by</b> @Link_Bypasss"
         )
-
         await status.edit_text(
             result,
             parse_mode="HTML",
@@ -149,7 +152,7 @@ async def handle_message(message):
         await status.edit_text(
             "⚠️ <b>Could not resolve this link</b>\n"
             f"<i>{html.escape(str(exc))}</i>\n\n"
-            "Check the URL and try again.",
+            "The bot will not label an intermediate page as the final destination.",
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
@@ -158,7 +161,7 @@ async def handle_message(message):
         await status.edit_text(
             "❌ <b>Resolution failed</b>\n"
             "The link could not be resolved right now. It may require a browser session "
-            "or access that is not available to the bot. Please try again later.",
+            "or access that is not available to the bot.",
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
@@ -167,10 +170,12 @@ async def handle_message(message):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global bot
+    init_storage()
     if config.BOT_TOKEN:
         bot = Bot(token=config.BOT_TOKEN)
         await bot.set_my_commands([
             BotCommand(command="start", description="Welcome and getting started"),
+            BotCommand(command="bypass", description="Resolve a shortened URL"),
             BotCommand(command="help", description="How to use the link resolver"),
             BotCommand(command="about", description="About this bot"),
         ])
@@ -188,8 +193,6 @@ async def lifespan(app: FastAPI):
         log.warning("BOT_TOKEN missing; service is healthy but Telegram bot is inactive")
     yield
     if bot:
-        # Do not delete the webhook during graceful shutdown: overlapping
-        # zero-downtime deploys could otherwise unregister the new instance.
         await bot.session.close()
 
 
