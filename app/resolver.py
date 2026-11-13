@@ -171,6 +171,7 @@ async def resolve_url(
     max_redirects = max(0, min(int(max_redirects), 10))
     timeout = max(3.0, min(float(timeout), 20.0))
     visited: set[str] = set()
+    last_unique = current
     limits = httpx.Limits(max_connections=8, max_keepalive_connections=4)
     request_timeout = httpx.Timeout(timeout, connect=min(timeout, 5.0))
 
@@ -187,8 +188,12 @@ async def resolve_url(
         for hop in range(max_redirects + 1):
             current = _normalise_url(current)
             if current in visited:
-                raise UnsafeURL("Redirect loop detected.")
+                # Some shorteners intentionally bounce between tracking URLs.
+                # Stop safely and return the last distinct URL reached instead
+                # of failing the entire request with a loop error.
+                return last_unique, max(0, hop - 1)
             visited.add(current)
+            last_unique = current
             await validate_public_url(current)
             try:
                 async with client.stream("GET", current) as response:
