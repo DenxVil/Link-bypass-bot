@@ -128,9 +128,9 @@ def _extract_base64_target(text: str, base_url: str) -> str | None:
 
 
 def _extract_embedded_target(body: bytes, content_type: str, base_url: str) -> str | None:
-    if not body or len(body) > MAX_BODY_BYTES:
+    if len(body) > MAX_BODY_BYTES:
         return None
-    text = body.decode("utf-8", errors="replace")
+    text = body.decode("utf-8", errors="replace") if body else ""
     lowered_type = content_type.lower()
     decoded_target = _extract_base64_target(text, base_url)
     if decoded_target:
