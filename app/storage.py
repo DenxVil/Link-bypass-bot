@@ -53,7 +53,11 @@ def init_storage():
 
 def cache_key(url: str) -> str:
     parts = urlsplit(url.strip())
-    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path, parts.query, ""))
+    # Versioned key invalidates destinations saved by the earlier, over-eager
+    # browser resolver without deleting rate-limit history.
+    return "resolver-v2:" + urlunsplit(
+        (parts.scheme.lower(), parts.netloc.lower(), parts.path, parts.query, "")
+    )
 
 
 def get_cached(source: str):
