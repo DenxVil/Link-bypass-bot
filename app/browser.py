@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import re
+from urllib.parse import urlsplit
 
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -9,34 +10,34 @@ from playwright.async_api import async_playwright
 
 from .resolver import UnsafeURL, validate_public_url
 
-
 BROWSER_SEMAPHORE = asyncio.Semaphore(1)
 BROWSER_LOGGER = logging.getLogger(__name__)
 
-
 CHALLENGE_MARKERS = (
-    "verify you are human",
-    "checking your browser",
-    "captcha",
-    "turnstile",
-    "hcaptcha",
-    "recaptcha",
+    "verify you are human", "checking your browser", "captcha",
+    "turnstile", "hcaptcha", "recaptcha",
 )
+INTERSTITIAL_MARKERS = (
+    "click here to continue", "continue to destination", "get your link",
+    "your link is ready", "skip this ad", "skip ad", "redirecting in",
+    "please wait", "link will be ready",
+)
+GATEWAY_HOSTS = {
+    "nowshort.com", "www.nowshort.com", "open.nowshort.com",
+    "liteshort.com", "www.liteshort.com",
+}
 
 
 async def resolve_with_browser(url: str, timeout: float = 12.0) -> tuple[str, int]:
-    # Keep one Chromium process active at a time on the small free instance.
     async with BROWSER_SEMAPHORE:
         return await _resolve_with_browser(url, timeout)
 
 
 async def _resolve_with_browser(url: str, timeout: float = 12.0) -> tuple[str, int]:
-    """Resolve ordinary client-side navigation in an isolated Chromium page.
-
-    This deliberately does not solve CAPTCHAs, click ads, defeat challenges,
-    or interact with protected gateway workflows.
-    """
+    """Follow ordinary browser redirects; never claim an obvious interstitial as final."""
     timeout_ms = int(max(5.0, min(timeout, 15.0)) * 1000)
+    source_host = (urlsplit(url).hostname or "").lower()
+    started_on_gateway = source_host in GATEWAY_HOSTS
     redirects = 0
     current_host = None
 
@@ -65,8 +66,7 @@ async def _resolve_with_browser(url: str, timeout: float = 12.0) -> tuple[str, i
     try:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
+                headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"]
             )
             try:
                 context = await browser.new_context(
@@ -74,9 +74,7 @@ async def _resolve_with_browser(url: str, timeout: float = 12.0) -> tuple[str, i
                         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                         "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
                     ),
-                    locale="en-US",
-                    java_script_enabled=True,
-                    accept_downloads=False,
+                    locale="en-US", java_script_enabled=True, accept_downloads=False,
                 )
                 page = await context.new_page()
                 await page.route("**/*", guard_route)
@@ -88,49 +86,44 @@ async def _resolve_with_browser(url: str, timeout: float = 12.0) -> tuple[str, i
                     await page.wait_for_load_state("networkidle", timeout=2500)
                 except PlaywrightTimeoutError:
                     pass
-                await page.wait_for_timeout(1200)
-                # Allow ordinary, visible countdown redirects to finish naturally.
-                # No buttons are clicked and no challenge is solved.
-                initial_url = page.url
-                try:
-                    initial_text = (await page.locator("body").inner_text(timeout=4000)).lower()[:5000]
-                except PlaywrightTimeoutError:
-                    # Some shortener handoff pages keep an empty or not-yet-attached body.
-                    # Body text is diagnostic only; it must not abort URL navigation.
-                    initial_text = ""
-                initial_host = re.match(r"^https?://([^/:]+)", initial_url, re.I)
-                gateway_page = bool(
-                    initial_host
-                    and initial_host.group(1).lower() in {
-                        "nowshort.com", "open.nowshort.com", "liteshort.com", "www.liteshort.com"
-                    }
-                )
-                visible_countdown = bool(re.search(
-                    r"\b\d{1,2}\s*(seconds?|secs?)\b|please wait|redirecting in|continue in|link is ready",
-                    initial_text,
-                ))
-                if gateway_page or visible_countdown:
-                    wait_seconds = max(0, min(int(os.getenv("BROWSER_WAIT_SECONDS", "15")), 15))
+
+                # Critical: page.goto may already have crossed from NowShort to an
+                # intermediate domain before the first URL snapshot. Always allow
+                # the whole gateway flow to settle, not only pages still on gateway hosts.
+                wait_seconds = max(0, min(int(os.getenv("BROWSER_WAIT_SECONDS", "20")), 25))
+                if started_on_gateway:
+                    last_url = page.url
+                    stable_seconds = 0
                     for _ in range(wait_seconds):
                         await page.wait_for_timeout(1000)
-                        current_match = re.match(r"^https?://([^/:]+)", page.url, re.I)
-                        current_host = current_match.group(1).lower() if current_match else ""
-                        if page.url != initial_url and current_host not in {
-                            "nowshort.com", "open.nowshort.com", "liteshort.com", "www.liteshort.com"
-                        }:
+                        observed = page.url
+                        if observed != last_url:
+                            last_url = observed
+                            stable_seconds = 0
+                        else:
+                            stable_seconds += 1
+                        # Require a short stable period after the last navigation,
+                        # while still preserving a minimum observation window.
+                        if _ >= 7 and stable_seconds >= 5:
                             break
+                else:
+                    await page.wait_for_timeout(1200)
+
                 final_url = page.url
                 try:
                     title = (await page.title()).lower()
                 except PlaywrightTimeoutError:
                     title = ""
                 try:
-                    body_text = (await page.locator("body").inner_text(timeout=4000)).lower()[:5000]
+                    body_text = (await page.locator("body").inner_text(timeout=2500)).lower()[:5000]
                 except PlaywrightTimeoutError:
                     body_text = ""
+
                 if any(marker in title or marker in body_text for marker in CHALLENGE_MARKERS):
+                    raise UnsafeURL("This destination requires human verification.")
+                if started_on_gateway and any(marker in body_text for marker in INTERSTITIAL_MARKERS):
                     raise UnsafeURL(
-                        "This destination requires a human verification or anti-bot check."
+                        "The shortener stopped at an intermediate page; it requires a page action or further redirect. No final destination was exposed."
                     )
                 await validate_public_url(final_url)
                 return final_url, redirects
@@ -139,12 +132,8 @@ async def _resolve_with_browser(url: str, timeout: float = 12.0) -> tuple[str, i
     except UnsafeURL:
         raise
     except (PlaywrightError, OSError, RuntimeError) as exc:
-        # Keep the detailed cause in Render logs so runtime/browser failures
-        # can be diagnosed without exposing stack traces to Telegram users.
         BROWSER_LOGGER.exception(
-            "Browser resolution failed (%s): %s",
-            type(exc).__name__,
-            str(exc)[:500],
+            "Browser resolution failed (%s): %s", type(exc).__name__, str(exc)[:500]
         )
         raise UnsafeURL(
             f"Browser resolution failed ({type(exc).__name__}); check service runtime logs."
