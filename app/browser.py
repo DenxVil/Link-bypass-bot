@@ -91,11 +91,26 @@ async def _resolve_with_browser(url: str, timeout: float = 12.0) -> tuple[str, i
                 # No buttons are clicked and no challenge is solved.
                 initial_url = page.url
                 initial_text = (await page.locator("body").inner_text(timeout=1500)).lower()[:5000]
-                if re.search(r"\b\d{1,2}\s*(seconds?|secs?)\b|please wait|redirecting in|continue in|link is ready", initial_text):
+                initial_host = re.match(r"^https?://([^/:]+)", initial_url, re.I)
+                gateway_page = bool(
+                    initial_host
+                    and initial_host.group(1).lower() in {
+                        "nowshort.com", "open.nowshort.com", "liteshort.com", "www.liteshort.com"
+                    }
+                )
+                visible_countdown = bool(re.search(
+                    r"\b\d{1,2}\s*(seconds?|secs?)\b|please wait|redirecting in|continue in|link is ready",
+                    initial_text,
+                ))
+                if gateway_page or visible_countdown:
                     wait_seconds = max(0, min(int(os.getenv("BROWSER_WAIT_SECONDS", "15")), 15))
                     for _ in range(wait_seconds):
                         await page.wait_for_timeout(1000)
-                        if page.url != initial_url:
+                        current_match = re.match(r"^https?://([^/:]+)", page.url, re.I)
+                        current_host = current_match.group(1).lower() if current_match else ""
+                        if page.url != initial_url and current_host not in {
+                            "nowshort.com", "open.nowshort.com", "liteshort.com", "www.liteshort.com"
+                        }:
                             break
                 final_url = page.url
                 title = (await page.title()).lower()
