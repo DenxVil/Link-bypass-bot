@@ -15,6 +15,16 @@ MAX_URL_LENGTH = 2048
 MAX_BODY_BYTES = 256 * 1024
 TARGET_KEYS = {"url", "target", "dest", "destination", "redirect", "redirect_url", "long_url", "link", "u"}
 
+GATEWAY_HOSTS = {"nowshort.com", "open.nowshort.com", "liteshort.com", "www.liteshort.com"}
+
+
+def _is_gateway_url(url: str) -> bool:
+    try:
+        host = (urlsplit(url).hostname or "").lower().rstrip(".")
+        return host in GATEWAY_HOSTS or any(host.endswith("." + item) for item in GATEWAY_HOSTS)
+    except ValueError:
+        return False
+
 
 class UnsafeURL(ValueError):
     """Raised when a URL is invalid, unsafe, or cannot be resolved."""
@@ -165,11 +175,17 @@ def _extract_embedded_target(body: bytes, content_type: str, base_url: str) -> s
             if target:
                 return target
 
+    base_host = (urlsplit(base_url).hostname or "").lower()
     for key, value in parse_qsl(urlsplit(base_url).query, keep_blank_values=False):
         if key.lower() in TARGET_KEYS:
             target = _http_target(unquote(value), base_url)
-            if target and target != base_url:
-                return target
+            if not target or target == base_url:
+                continue
+            target_host = (urlsplit(target).hostname or "").lower()
+            # This is a gateway hand-off, not the user's destination.
+            if base_host in {"liteshort.com", "www.liteshort.com"} and target_host == "open.nowshort.com":
+                continue
+            return target
     return None
 
 
@@ -197,6 +213,25 @@ async def resolve_url(
     last_unique = current
     limits = httpx.Limits(max_connections=8, max_keepalive_connections=4)
     request_timeout = httpx.Timeout(timeout, connect=min(timeout, 5.0))
+
+    # NowShort uses a multi-host gateway (nowshort -> liteshort -> open.nowshort).
+    # Let a normal browser execute its public page navigation first; the raw
+    # HTTP chain otherwise mistakes the gateway's own `url=` parameter for
+    # the final destination and cycles between internal gateway hosts.
+    if _is_gateway_url(current):
+        from .browser import resolve_with_browser
+
+        try:
+            browser_url, browser_hops = await resolve_with_browser(current, timeout)
+            if browser_url != current and not _is_gateway_url(browser_url):
+                await validate_public_url(browser_url)
+                return browser_url, browser_hops
+            if browser_url != current and _is_gateway_url(browser_url):
+                current = _normalise_url(browser_url)
+        except UnsafeURL:
+            # Retain the static HTTP path as a fallback. It will still reject
+            # loops and will never report a gateway page as a final result.
+            pass
 
     async with httpx.AsyncClient(
         follow_redirects=False,
@@ -239,6 +274,18 @@ async def resolve_url(
             except httpx.HTTPError as exc:
                 raise UnsafeURL("The destination could not be reached.") from exc
             if not embedded:
+                current_host = (urlsplit(current).hostname or "").lower()
+                if current_host in {"liteshort.com", "www.liteshort.com"}:
+                    # The LiteShort API/gateway response is never itself a
+                    # user destination. Give its ordinary page scripts a
+                    # browser pass; if it still stays on the gateway, fail.
+                    from .browser import resolve_with_browser
+
+                    browser_url, browser_hops = await resolve_with_browser(current, timeout)
+                    if browser_url != current and not _is_gateway_url(browser_url):
+                        await validate_public_url(browser_url)
+                        return browser_url, hop + browser_hops
+                    raise UnsafeURL("The NowShort gateway did not expose a final destination.")
                 if "html" in content_type.lower() and re.search(r"""<script\b""", body.decode("utf-8", errors="replace"), re.IGNORECASE):
                     # Browser fallback handles ordinary JavaScript-driven
                     # navigation. It does not interact with ads or challenges.
