@@ -1,18 +1,14 @@
 services:
   - type: web
     name: telegram-link-resolver
-    runtime: python
+    runtime: docker
     plan: free
     region: singapore
-    buildCommand: pip install -r requirements.txt && PLAYWRIGHT_BROWSERS_PATH=/opt/render/.cache/ms-playwright python -m playwright install chromium && PYTHONPATH=. pytest -q
-    startCommand: PLAYWRIGHT_BROWSERS_PATH=/opt/render/.cache/ms-playwright python -m playwright install chromium && uvicorn app.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /healthz
     autoDeploy: true
     envVars:
       - key: WEBHOOK_SECRET
         generateValue: true
-      - key: PLAYWRIGHT_BROWSERS_PATH
-        value: /opt/render/.cache/ms-playwright
       - key: GEMINI_MODEL
         value: gemini-2.5-flash
       - key: MAX_REDIRECTS
