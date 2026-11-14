@@ -17,6 +17,8 @@ TARGET_KEYS = {"url", "target", "dest", "destination", "redirect", "redirect_url
 
 GATEWAY_HOSTS = {"nowshort.com", "open.nowshort.com", "liteshort.com", "www.liteshort.com"}
 
+_BROWSER_SEMAPHORE = asyncio.Semaphore(1)
+
 
 def _is_gateway_url(url: str) -> bool:
     try:
@@ -71,7 +73,8 @@ async def validate_public_url(url: str) -> None:
     try:
         records = await asyncio.wait_for(
             asyncio.get_running_loop().getaddrinfo(
-                host, parts.port or (443 if parts.scheme == "https" else 80),
+                host,
+                parts.port or (443 if parts.scheme == "https" else 80),
                 type=socket.SOCK_STREAM,
             ),
             timeout=4.0,
@@ -119,18 +122,19 @@ def _targets_from_json(value, base_url: str, depth: int = 0) -> list[str]:
     return found
 
 
-
 def _extract_base64_target(text: str, base_url: str) -> str | None:
-    """Decode obvious base64/URL-safe-base64 destination strings."""
+    """Decode base64/URL-safe-base64 tokens that explicitly contain an http(s) URL."""
     for match in re.finditer(r"(?<![A-Za-z0-9_])[A-Za-z0-9_+/-]{20,}={0,2}", text[:MAX_BODY_BYTES]):
         token = match.group(0)
         try:
             raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
-            decoded = raw.decode("utf-8", errors="strict").strip().strip("\\\"'")
+            decoded = raw.decode("utf-8", errors="strict").strip().strip("\"'")
         except (binascii.Error, UnicodeDecodeError, ValueError):
             continue
         url_match = re.search(r"""https?://[^\s"'<>]+""", decoded, re.IGNORECASE)
-        candidate = url_match.group(0).rstrip(".,;:!?)") if url_match else decoded
+        if not url_match:
+            continue
+        candidate = url_match.group(0).rstrip(".,;:!?)")
         target = _http_target(candidate, base_url)
         if target and target != base_url:
             return target
@@ -142,9 +146,11 @@ def _extract_embedded_target(body: bytes, content_type: str, base_url: str) -> s
         return None
     text = body.decode("utf-8", errors="replace") if body else ""
     lowered_type = content_type.lower()
+
     decoded_target = _extract_base64_target(text, base_url)
     if decoded_target:
         return decoded_target
+
     if "json" in lowered_type or text.lstrip().startswith(("{", "[")):
         try:
             targets = _targets_from_json(json.loads(text), base_url)
@@ -154,8 +160,9 @@ def _extract_embedded_target(body: bytes, content_type: str, base_url: str) -> s
             pass
 
     meta = re.search(
-        r"<meta[^>]+http-equiv\s*=\s*['\"]?refresh['\"]?[^>]+content\s*=\s*['\"][^'\"]*?url\s*=\s*([^;'\"]+)",
-        text, re.IGNORECASE,
+        r"""<meta[^>]+http-equiv\s*=\s*['"]?refresh['"]?[^>]+content\s*=\s*['"][^'"]*?url\s*=\s*([^;'"]+)""",
+        text,
+        re.IGNORECASE,
     )
     if meta:
         target = _http_target(meta.group(1), base_url)
@@ -163,10 +170,10 @@ def _extract_embedded_target(body: bytes, content_type: str, base_url: str) -> s
             return target
 
     patterns = (
-        r"(?:window\.)?location\.href\s*=\s*['\"]([^'\"]+)['\"]",
-        r"(?:window\.)?location\.assign\(\s*['\"]([^'\"]+)['\"]\s*\)",
-        r"(?:window\.)?location\.replace\(\s*['\"]([^'\"]+)['\"]\s*\)",
-        r"window\.open\(\s*['\"]([^'\"]+)['\"]",
+        r"""(?:window\.)?location\.href\s*=\s*['"]([^'"]+)['"]""",
+        r"""(?:window\.)?location\.assign\(\s*['"]([^'"]+)['"]\s*\)""",
+        r"""(?:window\.)?location\.replace\(\s*['"]([^'"]+)['"]\s*\)""",
+        r"""window\.open\(\s*['"]([^'"]+)['"]""",
     )
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
@@ -182,7 +189,6 @@ def _extract_embedded_target(body: bytes, content_type: str, base_url: str) -> s
             if not target or target == base_url:
                 continue
             target_host = (urlsplit(target).hostname or "").lower()
-            # This is a gateway hand-off, not the user's destination.
             if base_host in {"liteshort.com", "www.liteshort.com"} and target_host == "open.nowshort.com":
                 continue
             return target
@@ -200,6 +206,13 @@ async def _read_limited_body(response: httpx.Response) -> bytes:
     return b"".join(chunks)
 
 
+async def _run_browser(url: str, timeout: float) -> tuple[str, int]:
+    from .browser import resolve_with_browser
+
+    async with _BROWSER_SEMAPHORE:
+        return await resolve_with_browser(url, timeout)
+
+
 async def resolve_url(
     url: str,
     max_redirects: int = 8,
@@ -207,30 +220,23 @@ async def resolve_url(
 ) -> tuple[str, int]:
     """Follow HTTP and common static HTML/JSON/JavaScript redirects safely."""
     current = _normalise_url(url)
+    await validate_public_url(current)
     max_redirects = max(0, min(int(max_redirects), 10))
     timeout = max(3.0, min(float(timeout), 20.0))
     visited: set[str] = set()
-    last_unique = current
     limits = httpx.Limits(max_connections=8, max_keepalive_connections=4)
     request_timeout = httpx.Timeout(timeout, connect=min(timeout, 5.0))
 
-    # NowShort uses a multi-host gateway (nowshort -> liteshort -> open.nowshort).
-    # Let a normal browser execute its public page navigation first; the raw
-    # HTTP chain otherwise mistakes the gateway's own `url=` parameter for
-    # the final destination and cycles between internal gateway hosts.
     if _is_gateway_url(current):
-        from .browser import resolve_with_browser
-
         try:
-            browser_url, browser_hops = await resolve_with_browser(current, timeout)
+            browser_url, browser_hops = await _run_browser(current, timeout)
+            browser_url = _normalise_url(browser_url)
+            await validate_public_url(browser_url)
             if browser_url != current and not _is_gateway_url(browser_url):
-                await validate_public_url(browser_url)
                 return browser_url, browser_hops
             if browser_url != current and _is_gateway_url(browser_url):
-                current = _normalise_url(browser_url)
-        except UnsafeURL:
-            # Retain the static HTTP path as a fallback. It will still reject
-            # loops and will never report a gateway page as a final result.
+                current = browser_url
+        except Exception:
             pass
 
     async with httpx.AsyncClient(
@@ -246,14 +252,12 @@ async def resolve_url(
         for hop in range(max_redirects + 1):
             current = _normalise_url(current)
             if current in visited:
-                # Never report an intermediate tracking page as a successful
-                # destination when the shortener is cycling between URLs.
                 raise UnsafeURL(
                     "The shortener is cycling between redirect pages and did not reveal a final destination."
                 )
             visited.add(current)
-            last_unique = current
             await validate_public_url(current)
+
             try:
                 async with client.stream("GET", current) as response:
                     if response.status_code in REDIRECT_CODES:
@@ -262,52 +266,68 @@ async def resolve_url(
                             return current, hop
                         if hop >= max_redirects:
                             raise UnsafeURL("Too many redirects.")
-                        current = urljoin(current, location)
+                        next_url = _normalise_url(urljoin(current, location))
+                        await validate_public_url(next_url)
+                        current = next_url
                         continue
+
                     content_type = response.headers.get("content-type", "")
                     if not any(t in content_type.lower() for t in ("text/html", "json", "text/plain", "javascript")):
                         return current, hop
+
                     body = await _read_limited_body(response)
                     embedded = _extract_embedded_target(body, content_type, current)
             except httpx.TimeoutException as exc:
                 raise UnsafeURL("The destination timed out.") from exc
             except httpx.HTTPError as exc:
                 raise UnsafeURL("The destination could not be reached.") from exc
+
             if not embedded:
                 current_host = (urlsplit(current).hostname or "").lower()
                 if current_host in {"liteshort.com", "www.liteshort.com"}:
-                    # The LiteShort API/gateway response is never itself a
-                    # user destination. Give its ordinary page scripts a
-                    # browser pass; if it still stays on the gateway, fail.
-                    from .browser import resolve_with_browser
-
-                    browser_url, browser_hops = await resolve_with_browser(current, timeout)
-                    if browser_url != current and not _is_gateway_url(browser_url):
+                    try:
+                        browser_url, browser_hops = await _run_browser(current, timeout)
+                        browser_url = _normalise_url(browser_url)
                         await validate_public_url(browser_url)
-                        return browser_url, hop + browser_hops
+                        if browser_url != current and not _is_gateway_url(browser_url):
+                            return browser_url, hop + browser_hops
+                    except UnsafeURL:
+                        raise
+                    except Exception:
+                        pass
                     raise UnsafeURL("The NowShort gateway did not expose a final destination.")
-                if "html" in content_type.lower() and re.search(r"""<script\b""", body.decode("utf-8", errors="replace"), re.IGNORECASE):
-                    # Browser fallback handles ordinary JavaScript-driven
-                    # navigation. It does not interact with ads or challenges.
-                    from .browser import resolve_with_browser
 
-                    browser_url, browser_hops = await resolve_with_browser(current, timeout)
-                    if browser_url != current:
-                        if browser_url in visited:
-                            raise UnsafeURL(
-                                "The browser encountered a redirect loop before exposing a final destination."
-                            )
-                        current = browser_url
-                        continue
-                    return current, hop + browser_hops
+                if "html" in content_type.lower() and re.search(
+                    r"""<script\b""", body.decode("utf-8", errors="replace"), re.IGNORECASE
+                ):
+                    try:
+                        browser_url, browser_hops = await _run_browser(current, timeout)
+                        browser_url = _normalise_url(browser_url)
+                        await validate_public_url(browser_url)
+                        if browser_url != current:
+                            if browser_url in visited:
+                                raise UnsafeURL(
+                                    "The browser encountered a redirect loop before exposing a final destination."
+                                )
+                            if hop >= max_redirects:
+                                raise UnsafeURL("Too many redirects.")
+                            current = browser_url
+                            continue
+                        return current, hop + browser_hops
+                    except UnsafeURL:
+                        raise
+                    except Exception:
+                        return current, hop
                 return current, hop
-            # An embedded redirect back to a visited page is also a loop.
-            # Do not return the current interstitial page as if it were final.
+
+            embedded = _normalise_url(embedded)
+            await validate_public_url(embedded)
             if embedded in visited:
                 raise UnsafeURL(
-                    "The shortener returned a redirect loop before exposing the final destination."
+                    "The shortener returned a redirect loop before exposing a final destination."
                 )
             if hop >= max_redirects:
                 raise UnsafeURL("Too many redirects.")
             current = embedded
+
     return current, max_redirects
