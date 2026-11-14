@@ -122,6 +122,33 @@ async def _resolve_with_browser(url: str, timeout: float = 12.0) -> tuple[str, i
                 if any(marker in title or marker in body_text for marker in CHALLENGE_MARKERS):
                     raise UnsafeURL("This destination requires human verification.")
                 if started_on_gateway and any(marker in body_text for marker in INTERSTITIAL_MARKERS):
+                    # Record only visible control labels and URL host/path (never query
+                    # strings, which may contain session tokens) to diagnose hand-offs.
+                    try:
+                        controls = await page.locator(
+                            "button, a, input[type=button], input[type=submit]"
+                        ).evaluate_all("""els => els.slice(0, 30).map(el => {
+                            const r = el.getBoundingClientRect();
+                            const visible = !!(r.width && r.height) &&
+                                getComputedStyle(el).visibility !== 'hidden' &&
+                                getComputedStyle(el).display !== 'none';
+                            const raw = el.href || el.formAction || '';
+                            let target = '';
+                            try {
+                                const u = new URL(raw);
+                                target = u.hostname + u.pathname;
+                            } catch (_) {}
+                            return {tag: el.tagName, text: (el.innerText || el.value || el.getAttribute('aria-label') || '').trim().slice(0, 100), visible, target};
+                        })""")
+                    except PlaywrightError:
+                        controls = []
+                    BROWSER_LOGGER.warning(
+                        "Shortener interstitial diagnostics: url=%s title=%r controls=%s body=%r",
+                        urlsplit(final_url).hostname,
+                        title[:160],
+                        controls,
+                        body_text[:600],
+                    )
                     raise UnsafeURL(
                         "The shortener stopped at an intermediate page; it requires a page action or further redirect. No final destination was exposed."
                     )
