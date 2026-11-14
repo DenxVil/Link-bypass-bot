@@ -1,14 +1,16 @@
+import asyncio
+from collections import OrderedDict
+from contextlib import asynccontextmanager
 import html
 import hmac
 import logging
 import os
 import re
 import time
-from contextlib import asynccontextmanager
 
 from aiogram import Bot, Dispatcher
 from aiogram.types import BotCommand, Update
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from . import config
@@ -21,14 +23,17 @@ bot: Bot | None = None
 dp = Dispatcher()
 URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 
+_SEEN_UPDATES: OrderedDict[int, float] = OrderedDict()
+_MAX_SEEN_UPDATES = 2048
+
 WELCOME_TEXT = (
     "👋 <b>Welcome to Link Resolver</b>\n"
     "<i>Your quick assistant for expanding supported shortened links.</i>\n\n"
     "🔎 <b>Features</b>\n"
-    "  • Trace public HTTP redirects and encoded destinations\n"
-    "  • Use Chromium for ordinary JavaScript navigation\n"
-    "  • Cache successful results for faster repeat lookups\n"
-    "  • Show live progress and the final resolved URL\n\n"
+    " • Trace public HTTP redirects and encoded destinations\n"
+    " • Use Chromium for ordinary JavaScript navigation\n"
+    " • Cache successful results for faster repeat lookups\n"
+    " • Show live progress and the final resolved URL\n\n"
     "🚀 <b>How to use</b>\n"
     "Send a shortened link directly, or use <code>/bypass URL</code>.\n\n"
     "Use /help for commands and limitations."
@@ -37,19 +42,19 @@ WELCOME_TEXT = (
 HELP_TEXT = (
     "📘 <b>LINK RESOLVER — HELP</b>\n\n"
     "<b>Commands</b>\n"
-    "  /start — Welcome and getting started\n"
-    "  /bypass URL — Resolve a link\n"
-    "  /help — Show these instructions\n"
-    "  /about — About this bot\n\n"
+    " /start — Welcome and getting started\n"
+    " /bypass URL — Resolve a link\n"
+    " /help — Show these instructions\n"
+    " /about — About this bot\n\n"
     "<b>Resolution methods</b>\n"
-    "  • HTTP redirect tracing and static destination extraction\n"
-    "  • Base64/URL-safe-base64 destination extraction\n"
-    "  • Headless Chromium for ordinary JavaScript navigation\n"
-    "  • SQLite cache and a limit of 40 requests per hour per user\n\n"
+    " • HTTP redirect tracing and static destination extraction\n"
+    " • Base64/URL-safe-base64 destination extraction\n"
+    " • Headless Chromium for ordinary JavaScript navigation\n"
+    " • SQLite cache and a limit of 40 requests per hour per user\n\n"
     "<b>Limitations</b>\n"
-    "  • CAPTCHA, login, paywalls, and anti-bot challenges are not bypassed.\n"
-    "  • The bot does not click ads or replay protected gateway tokens.\n"
-    "  • Some sites may require a real user session.\n\n"
+    " • CAPTCHA, login, paywalls, and anti-bot challenges are not bypassed.\n"
+    " • The bot does not click ads or replay protected gateway tokens.\n"
+    " • Some sites may require a real user session.\n\n"
     "⚠️ A resolved URL is not a guarantee that its destination is safe."
 )
 
@@ -94,7 +99,7 @@ async def handle_message(message):
         )
         return
 
-    allowed, retry_after = allow_request(message.from_user.id)
+    allowed, retry_after = await asyncio.to_thread(allow_request, message.from_user.id)
     if not allowed:
         minutes = max(1, (retry_after + 59) // 60)
         await message.answer(
@@ -113,7 +118,7 @@ async def handle_message(message):
 
     try:
         started_at = time.perf_counter()
-        cached = get_cached(url)
+        cached = await asyncio.to_thread(get_cached, url)
         was_cached = cached is not None
         if cached:
             destination, hops = cached
@@ -123,7 +128,7 @@ async def handle_message(message):
                 max_redirects=config.MAX_REDIRECTS,
                 timeout=config.REQUEST_TIMEOUT,
             )
-            put_cached(url, destination, hops)
+            await asyncio.to_thread(put_cached, url, destination, hops)
 
         elapsed_seconds = time.perf_counter() - started_at
         safe_original = html.escape(url)
@@ -136,7 +141,7 @@ async def handle_message(message):
             "📥 <b>Original Link</b>\n"
             f"<code>{safe_original}</code>\n\n"
             "🚀 <b>Final Destination</b>\n"
-            f"🔗 <a href=\"{safe_href}\">{safe_destination}</a>\n\n"
+            f'<a href="{safe_href}">{safe_destination}</a>\n\n'
             f"⏱ <b>Time Taken:</b> <code>{elapsed_seconds:.2f} seconds</code>\n"
             f"🧭 <b>Redirect steps:</b> <code>{hops}</code>\n"
             f"{cache_note}\n"
@@ -167,6 +172,13 @@ async def handle_message(message):
         )
 
 
+async def _process_update(current_bot: Bot, update: Update) -> None:
+    try:
+        await dp.feed_update(current_bot, update)
+    except Exception:
+        log.exception("Background update processing failed for update_id=%s", update.update_id)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global bot
@@ -179,7 +191,9 @@ async def lifespan(app: FastAPI):
             BotCommand(command="help", description="How to use the link resolver"),
             BotCommand(command="about", description="About this bot"),
         ])
-        public_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+        public_url = (
+            os.getenv("RENDER_EXTERNAL_URL") or os.getenv("WEBHOOK_BASE_URL", "")
+        ).strip().rstrip("/")
         if public_url:
             await bot.set_webhook(
                 url=f"{public_url}/telegram/webhook",
@@ -199,12 +213,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Telegram Link Resolver", lifespan=lifespan)
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     return {"service": "telegram-link-resolver", "status": "ok"}
 
 
-@app.get("/healthz")
+@app.api_route("/healthz", methods=["GET", "HEAD"])
 async def healthz():
     return {"status": "ok", "bot_configured": bool(config.BOT_TOKEN)}
 
@@ -212,6 +226,7 @@ async def healthz():
 @app.post("/telegram/webhook")
 async def telegram_webhook(
     request: Request,
+    background_tasks: BackgroundTasks,
     x_telegram_bot_api_secret_token: str | None = Header(default=None),
 ):
     if not bot:
@@ -220,11 +235,19 @@ async def telegram_webhook(
         x_telegram_bot_api_secret_token, config.WEBHOOK_SECRET
     ):
         raise HTTPException(status_code=403, detail="Forbidden")
+
     try:
         payload = await request.json()
         update = Update.model_validate(payload, context={"bot": bot})
-        await dp.feed_update(bot, update)
     except Exception:
-        log.exception("Webhook update processing failed")
-        raise HTTPException(status_code=500, detail="Update processing failed")
+        log.exception("Invalid Telegram update payload")
+        raise HTTPException(status_code=400, detail="Invalid update payload")
+
+    if update.update_id in _SEEN_UPDATES:
+        return JSONResponse({"ok": True, "duplicate": True})
+    _SEEN_UPDATES[update.update_id] = time.time()
+    while len(_SEEN_UPDATES) > _MAX_SEEN_UPDATES:
+        _SEEN_UPDATES.popitem(last=False)
+
+    background_tasks.add_task(_process_update, bot, update)
     return JSONResponse({"ok": True})
