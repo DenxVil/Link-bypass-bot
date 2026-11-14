@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import re
 
@@ -10,6 +11,7 @@ from .resolver import UnsafeURL, validate_public_url
 
 
 BROWSER_SEMAPHORE = asyncio.Semaphore(1)
+BROWSER_LOGGER = logging.getLogger(__name__)
 
 
 CHALLENGE_MARKERS = (
@@ -126,6 +128,13 @@ async def _resolve_with_browser(url: str, timeout: float = 12.0) -> tuple[str, i
     except UnsafeURL:
         raise
     except (PlaywrightError, OSError, RuntimeError) as exc:
+        # Keep the detailed cause in Render logs so runtime/browser failures
+        # can be diagnosed without exposing stack traces to Telegram users.
+        BROWSER_LOGGER.exception(
+            "Browser resolution failed (%s): %s",
+            type(exc).__name__,
+            str(exc)[:500],
+        )
         raise UnsafeURL(
-            "Browser-based resolution was unavailable; this page may require a browser session."
+            f"Browser resolution failed ({type(exc).__name__}); check service runtime logs."
         ) from exc
