@@ -5,7 +5,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-
 DB_PATH = os.getenv("SQLITE_PATH", "/tmp/link-resolver.sqlite3")
 CACHE_TTL_SECONDS = max(60, int(os.getenv("CACHE_TTL_SECONDS", "86400")))
 RATE_LIMIT_COUNT = max(1, int(os.getenv("RATE_LIMIT_COUNT", "40")))
@@ -15,23 +14,28 @@ RATE_LIMIT_WINDOW = max(60, int(os.getenv("RATE_LIMIT_WINDOW", "3600")))
 def _connect():
     path = Path(DB_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), timeout=10)
+    conn = sqlite3.connect(str(path), timeout=10, isolation_level=None)
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
 @contextmanager
-def _db():
+def _db(immediate: bool = False):
     conn = _connect()
     try:
-        with conn:
-            yield conn
+        conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+        yield conn
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
     finally:
         conn.close()
 
 
 def init_storage():
-    with _db() as conn:
+    with _db(immediate=True) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS resolutions (
                 source TEXT PRIMARY KEY,
@@ -53,35 +57,34 @@ def init_storage():
 
 def cache_key(url: str) -> str:
     parts = urlsplit(url.strip())
-    # Versioned key invalidates destinations saved by the earlier, over-eager
-    # browser resolver without deleting rate-limit history.
-    return "resolver-v2:" + urlunsplit(
+    return "resolver-v3:" + urlunsplit(
         (parts.scheme.lower(), parts.netloc.lower(), parts.path, parts.query, "")
     )
 
 
 def get_cached(source: str):
     cutoff = time.time() - CACHE_TTL_SECONDS
-    with _db() as conn:
+    with _db(immediate=False) as conn:
         row = conn.execute(
             "SELECT destination, hops FROM resolutions WHERE source=? AND created_at>=?",
             (cache_key(source), cutoff),
         ).fetchone()
         if row:
             return row[0], row[1]
+    with _db(immediate=True) as conn:
         conn.execute("DELETE FROM resolutions WHERE created_at<?", (cutoff,))
     return None
 
 
 def put_cached(source: str, destination: str, hops: int):
-    with _db() as conn:
+    with _db(immediate=True) as conn:
         conn.execute(
             """INSERT INTO resolutions(source, destination, hops, created_at)
                VALUES(?, ?, ?, ?)
                ON CONFLICT(source) DO UPDATE SET
-                 destination=excluded.destination,
-                 hops=excluded.hops,
-                 created_at=excluded.created_at""",
+                   destination=excluded.destination,
+                   hops=excluded.hops,
+                   created_at=excluded.created_at""",
             (cache_key(source), destination, int(hops), time.time()),
         )
 
@@ -89,7 +92,7 @@ def put_cached(source: str, destination: str, hops: int):
 def allow_request(user_id: int) -> tuple[bool, int]:
     now = time.time()
     cutoff = now - RATE_LIMIT_WINDOW
-    with _db() as conn:
+    with _db(immediate=True) as conn:
         conn.execute("DELETE FROM rate_events WHERE created_at<?", (cutoff,))
         count = conn.execute(
             "SELECT COUNT(*) FROM rate_events WHERE user_id=? AND created_at>=?",
