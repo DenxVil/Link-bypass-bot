@@ -92,7 +92,12 @@ async def _resolve_with_browser(url: str, timeout: float = 12.0) -> tuple[str, i
                 # Allow ordinary, visible countdown redirects to finish naturally.
                 # No buttons are clicked and no challenge is solved.
                 initial_url = page.url
-                initial_text = (await page.locator("body").inner_text(timeout=1500)).lower()[:5000]
+                try:
+                    initial_text = (await page.locator("body").inner_text(timeout=4000)).lower()[:5000]
+                except PlaywrightTimeoutError:
+                    # Some shortener handoff pages keep an empty or not-yet-attached body.
+                    # Body text is diagnostic only; it must not abort URL navigation.
+                    initial_text = ""
                 initial_host = re.match(r"^https?://([^/:]+)", initial_url, re.I)
                 gateway_page = bool(
                     initial_host
@@ -115,8 +120,14 @@ async def _resolve_with_browser(url: str, timeout: float = 12.0) -> tuple[str, i
                         }:
                             break
                 final_url = page.url
-                title = (await page.title()).lower()
-                body_text = (await page.locator("body").inner_text(timeout=1500)).lower()[:5000]
+                try:
+                    title = (await page.title()).lower()
+                except PlaywrightTimeoutError:
+                    title = ""
+                try:
+                    body_text = (await page.locator("body").inner_text(timeout=4000)).lower()[:5000]
+                except PlaywrightTimeoutError:
+                    body_text = ""
                 if any(marker in title or marker in body_text for marker in CHALLENGE_MARKERS):
                     raise UnsafeURL(
                         "This destination requires a human verification or anti-bot check."
